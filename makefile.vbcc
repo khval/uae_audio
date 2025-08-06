@@ -1,0 +1,30 @@
+
+CFLAGS = +aos68k -cpu=68020 
+
+cc = vc
+
+build = uae.audio test_uae_audio test_uae_audio2
+
+all: $(build)
+
+uae.audio: uae.audio.c subFuncs.c
+		$(cc) $(CFLAGS)  -o uae.audio uae.audio.c -I./ 
+		copy uae.audio work:UAE-HD/Workbench3.2-PIMP-040/Devs/AHI
+
+test_uae_audio: test_uae_audio.c
+		$(cc) $(CFLAGS)  -o test_uae_audio test_uae_audio.c -I./ 
+		Protect test_uae_audio +e
+		copy test_uae_audio work:UAE-HD/work/test
+
+test_uae_audio2: test_uae_audio2.c
+		$(cc) $(CFLAGS)  -o test_uae_audio2 test_uae_audio2.c -I./ 
+		Protect test_uae_audio2 +e
+		copy test_uae_audio2 work:UAE-HD/work/test
+
+clean:
+		delete $(build)
+
+install:
+		copy uae.device libs:
+
+

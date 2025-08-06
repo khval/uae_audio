@@ -1,0 +1,26 @@
+
+CFLAGS = -L/gg/os-lib
+
+cc = /gg/bin/gcc
+
+build = uaeahi.audio test_uaeahi_device
+
+all: $(build)
+		/c/Protect test_uaeahi_device +e
+
+
+uaeahi.audio: uaeahi.audio.c
+		$(cc) $(CFLAGS) -noixemul -o uaeahi.audio uaeahi.audio.c -I./ 
+		/c/copy uaeahi.audio devs:
+
+test_uaeahi_device: test_uaeahi_device.c
+		$(cc) $(CFLAGS) -noixemul -o test_uaeahi_device test_uaeahi_device.c -I./ 
+		/c/protect test_uaeahi_device +e
+		
+clean:
+		/c/delete $(build)
+
+install:
+		copy uaeahi.device libs:
+
+
