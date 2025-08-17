@@ -5,19 +5,21 @@
 #define MAX_SOUNDS 10
 #define MAX_CHANNELS 5
 
+
 struct SoundEntry
 {
 	ULONG type;
 	APTR address;
-	ULONG length;
+	ULONG length;	
 };
 
 struct UAEAudioChannel
 {
 	BOOL active;
-	ULONG type;
-	ULONG current;
-	struct SoundEntry buffer[2];
+	BOOL reverse;
+	ULONG offset; /* offset can count backwards if length is negative */
+	ULONG length; /* show the direction of playback */
+	struct SoundEntry sound;
 };
 
 struct DriverData
@@ -35,16 +37,16 @@ struct DriverData
 	LONG mixSignal;
 
 	LONG mode;
-	APTR SampBuffer1;
-	APTR SampBuffer2;
-
-	APTR mixbuffer;
+	APTR SampBuffer[2];
 };
 
 
 typedef BOOL PreTimer_proto( struct AHIAudioCtrlDrv * );
 typedef void PostTimer_proto( struct AHIAudioCtrlDrv * );
-BOOL StartPlaying(struct AHIAudioCtrlDrv *AudioCtrl, struct Process *me);
+
+BOOL StartPlaying(struct AHIAudioCtrlDrv *AudioCtrl, struct Process *me, APTR buffer);
+
+static BOOL CopyChannelToPlayback(struct UAEAudioChannel *chan, UBYTE *playBuf, ULONG bufSize);
 
 void UNum2HostPutStr( const char *what,ULONG num )
 {
@@ -208,7 +210,7 @@ ULONG uaeahi_AllocAudio(
 		for (n=0;n<MAX_CHANNELS;n++)
 		{
 			DriverData -> channels[n].active = FALSE;
-			DriverData -> channels[n].current = 0;
+			DriverData -> channels[n].offset = 0;
 		}
 	}
 
@@ -290,6 +292,30 @@ ULONG  h_Entry_test(__reg("a0") struct Hook *_hook , __reg("a2") APTR _object , 
 }
 
 
+void free_resources( struct AHIAudioCtrlDrv *AudioCtrl )
+{
+	int n;
+
+	if ( dd->playSignal == -1 ) FreeSignal(dd->playSignal);
+	if ( dd->mixSignal == -1 ) FreeSignal(dd->mixSignal);
+
+	for (n=0;n<2;n++)
+	{
+		if ( dd->SampBuffer[n] ) FreeVec(dd->SampBuffer[n]);
+		dd->SampBuffer[n] = NULL;
+	}
+
+	dd->playSignal = -1;
+	dd->mixSignal = -1;
+}
+
+static void u32zero( char *addr, ULONG size )
+{
+	ULONG *ptr = (ULONG *) addr;
+
+	size >>=2;	/* DIV 4 */
+	while (size--) *ptr++= 0;
+}
 
 void fn_AudioTask(void)
 {
@@ -301,32 +327,45 @@ void fn_AudioTask(void)
 	BOOL pretimer_rc;
 	ULONG sigmask;
 
+	ULONG bytesToCopy;
+	struct UAEAudioChannel *chan;
+	struct DriverData *DriverData;
+
+	APTR currentBuffer;
+	int cb = 0;
+
 	me = (struct Process *) FindTask(NULL);
-	if ( me -> pr_Task.tc_UserData )
-	{
-		AudioCtrl = (struct AHIAudioCtrlDrv *)  me -> pr_Task.tc_UserData;
-		dd -> playSignal = AllocSignal(-1);
-		dd -> mixSignal = AllocSignal(-1);
-		Signal( dd -> mainTask,  1L << dd -> mainSignal );
-	}
-	else
+
+	if ( me -> pr_Task.tc_UserData == NULL )
 	{
 		SafeLog("Process AudioTask failed...\n");
 		Signal( dd -> mainTask,  1L << dd -> mainSignal );
 		return;
 	}
 
+	AudioCtrl = (struct AHIAudioCtrlDrv *)  me -> pr_Task.tc_UserData;
+
+	dd -> playSignal = AllocSignal(-1);
+	dd -> mixSignal = AllocSignal(-1);
+	dd -> SampBuffer[0] = AllocVec( PLAYBUFFERSIZE, MEMF_FAST );
+	dd -> SampBuffer[1] = AllocVec( PLAYBUFFERSIZE, MEMF_FAST );
+
+	if ( (dd -> playSignal==-1) || (dd -> mixSignal==-1) || (dd -> SampBuffer[0]==NULL) || (dd -> SampBuffer[1]==NULL) )
+	{
+		free_resources( AudioCtrl );
+		Signal( dd -> mainTask,  1L << dd -> mainSignal );
+		return;
+	}
+
+	Signal( dd -> mainTask,  1L << dd -> mainSignal );
+
 	Delay(500);	/* just try not write into the same console at the same time... */
 
 	sigmask = SIGBREAKF_CTRL_C | (1L << dd -> playSignal) | (1L << dd -> mixSignal);
 
 	SafeLog("Process audioTask: started, waiting on signals...\n");
-
-	SNum2HostPutStr(" playSignal: ", dd -> playSignal );
-	SNum2HostPutStr(" mixSignal: ", dd -> mixSignal );
 	Hex2HostPutStr(" wating on sigmask: ", (ULONG) sigmask );
 	SafeLog("\n");
-
 
 	for (;;)
 	{
@@ -345,8 +384,32 @@ void fn_AudioTask(void)
 
 		if (signalset & (1L<<dd -> playSignal))
 		{
-			SafeLog("Process audioTask: PlaySingal bit set...\n");
-			StartPlaying( AudioCtrl,  (struct Process *) me );
+			SafeLog("Process audioTask: PlaySingal bit set...");
+				UNum2HostPutStr("buffer idx: ", cb );
+				SafeLog("\n");
+
+			DriverData = (struct DriverData *) AudioCtrl->ahiac_DriverData;
+			if (DriverData) 
+			{
+				bytesToCopy = ((chan -> length) > PLAYBUFFERSIZE) ? PLAYBUFFERSIZE : (chan -> length);
+				currentBuffer = dd -> SampBuffer[cb];
+
+				if ( CopyChannelToPlayback( &DriverData->channels[0], currentBuffer , bytesToCopy ))
+				{
+					if (bytesToCopy<PLAYBUFFERSIZE)
+					{
+						u32zero( (char *) currentBuffer + bytesToCopy, PLAYBUFFERSIZE - bytesToCopy );
+					}
+				}
+				else
+				{
+					u32zero( currentBuffer, PLAYBUFFERSIZE );
+				}
+
+				StartPlaying( AudioCtrl,  (struct Process *) me, currentBuffer );
+			}
+
+			cb ^=1;	/* toggel bit 0 */
 		}
 
 		if (signalset & (1L<<dd -> mixSignal))
@@ -368,13 +431,13 @@ void fn_AudioTask(void)
 				if (AudioCtrl->ahiac_PlayerFunc)
 				{
 					SafeLog("my_CallHookPkt( AudioCtrl->ahiac_PlayerFunc, AudioCtrl, NULL );\n");
-				    my_CallHookPkt( AudioCtrl->ahiac_PlayerFunc, AudioCtrl, NULL );
+					my_CallHookPkt( AudioCtrl->ahiac_PlayerFunc, AudioCtrl, currentBuffer );
 				}
-	
+
 				if (AudioCtrl->ahiac_MixerFunc)
 				{
 					SafeLog("my_CallHookPkt( AudioCtrl->ahiac_MixerFunc, AudioCtrl, NULL );\n");
-				    my_CallHookPkt( AudioCtrl->ahiac_MixerFunc, AudioCtrl, dd -> mixbuffer );  
+					my_CallHookPkt( AudioCtrl->ahiac_MixerFunc, AudioCtrl, currentBuffer );  
 				}
 	
 				if (posttimer) posttimer(AudioCtrl);
@@ -387,10 +450,7 @@ void fn_AudioTask(void)
 	/* Task exits here */
 	dd -> audioTask = NULL;
 
-	if (dd->playSignal==-1) FreeSignal(dd->playSignal);
-	if (dd->mixSignal==-1) FreeSignal(dd->mixSignal);
-	dd->playSignal = -1;
-	dd->mixSignal = -1;
+	free_resources( AudioCtrl );
 
 	Signal( (struct Task *) dd->audioTask,1L << dd->mainSignal);
 }
@@ -413,8 +473,6 @@ ULONG uaeahi_Start(
 			{ NP_StackSize, 4096 },
 			{ NP_Priority,  5 },
 			{ TAG_DONE,     0 }};
-
-		dd->mixbuffer = AllocVec( AudioCtrl->ahiac_BuffSize, MEMF_FAST | MEMF_PUBLIC );
 
 		if (Flags & AHISF_PLAY)
 		{
@@ -517,7 +575,7 @@ ULONG uaeahi_SetSound(
 		REG(d0, UWORD Channel), 
 		REG(d1, UWORD Sound), 
 		REG(d2, UWORD Offset), 
-		REG(d3, UWORD Length), 
+		REG(d3, WORD Length), 
 		REG(a2, struct AHIAudioCtrlDrv * AudioCtrl), 
 		REG(d4, ULONG Flags))
 {
@@ -545,11 +603,13 @@ ULONG uaeahi_SetSound(
 
 	if (Sound == AHI_NOSOUND)
 	{
-		Offset = 0;
-		Length = 0;
-		chan->type = AHIST_NOTYPE;
+		Forbid();
+		chan->offset = 0;
+		chan->sound.type = AHIST_NOTYPE;
+		chan->sound.length = 0;
+		Permit();
 
-		 SafeLog(" Sound == AHI_NOSOUND (Turns a channel off)\n ");
+		 SafeLog(" Sound == AHI_NOSOUND (mutes a channel)\n ");
 	}
 	else
 	{
@@ -558,51 +618,45 @@ ULONG uaeahi_SetSound(
 		snd = &DriverData->sounds[Sound];
 
 		if (!snd->address || snd->length == 0)  return AHIE_BADSOUNDTYPE;
-		if (Length == 0 || Offset + Length > snd->length)
+
+		if (Length == 0 ||  Length > snd->length)
 		{
 			 SafeLog(" Length == 0, using sound length insted\n");
-			Length = snd->length - Offset;
+			Length = snd->length ;
 		}
 
-		chan -> type = snd->type;
-		tmp.address = (UBYTE *)snd->address + Offset;
-		tmp.length = Length;
+		tmp.type = snd -> type;
+		tmp.address = snd->address ;
+
+		/* limit Length so safe ranges. */
+		if (Length > snd->length) Length = snd->length;
+
+		Forbid();
+		chan->reverse = ((LONG) Length < 0) ? TRUE : FALSE;
+		chan->offset = Offset;
+		chan->length = Length;
+		chan->sound = tmp;
+		Permit();
 	}
-
-	/* Check for reverse playback */
-	if ((LONG) Length < 0)
-	{
-		SafeLog(" Length is negative, reverse playback\n ");
-
-		tmp.length = -((LONG) Length);
-		chan->type |= AHIST_BW;
-	}
-
-	/* Save as "next" values (to be committed by Enable or immediately) */
-
-	chan->buffer[next(chan->current)] = tmp;
 
 	if (Flags & (1L<<AHISB_IMM))
 	{
 		struct AHISoundMessage msg;
 
 		/* Immediate play (simulate Enable) */
-
 		SafeLog(" Immediate play (simulate Enable)\n ");
 
 		chan->active = TRUE;
-		chan->current = next(chan->current);	/* swap buffer */
+
+		Forbid();
+		chan -> sound.type = snd->type;
+		chan -> offset = Offset;
+		Permit();
 
 		msg.ahism_Channel = Channel;
 
+		/* Send channel to playback routine for scheduling */
 		my_CallHookPkt( AudioCtrl->ahiac_SoundFunc, AudioCtrl, &msg);
-
-		/* Send sample to host now (optional for software-based drivers) */
-
-		current = chan -> buffer + (chan->current);
-/*
-		PushAudioSample(current -> address, current -> length, current -> type, AudioCtrl->ahiac_MixFreq >> 16);
-*/
 	}
 
 	return AHIE_OK;
@@ -767,7 +821,7 @@ ULONG uaeahi_HardwareControl(
 
 #define set_tag( tagv, value ) *tag++=tagv; *tag++= (ULONG) value; 
 
-BOOL StartPlaying(struct AHIAudioCtrlDrv *AudioCtrl, struct Process *me)
+BOOL StartPlaying(struct AHIAudioCtrlDrv *AudioCtrl, struct Process *me, APTR buffer)
 {
 	BOOL playing;
 	ULONG *tag;
@@ -779,20 +833,19 @@ BOOL StartPlaying(struct AHIAudioCtrlDrv *AudioCtrl, struct Process *me)
 	set_tag( PAT_LoopbackVolume, -64 );
 	set_tag( TAG_DONE, 0 );
 
-	tag = raw_playback_tags;
-
-	set_tag( TT_ErrorTask,   me );
-	set_tag( TT_ErrorMask,   (1L << dd->playSignal) );
-	set_tag( TT_Mode, dd->mode );
-	set_tag( TT_Frequency, AudioCtrl->ahiac_MixFreq );
-	set_tag( TT_RawBuffer1, dd->SampBuffer1 );
-	set_tag( TT_RawBuffer2, dd->SampBuffer2 );
-	set_tag( TT_BufferSize, PLAYBUFFERSIZE );
-	set_tag( TAG_DONE, 0 );
-
   	/* Disable Loopback */
 
 	SetPartTagList( set_part_tags );
+
+	tag = raw_playback_tags;
+
+	set_tag( TT_PlayTask,   me );
+	set_tag( TT_PlaySignal,   dd->playSignal );
+	set_tag( TT_Mode, dd->mode );
+	set_tag( TT_Frequency, AudioCtrl->ahiac_MixFreq );
+	set_tag( TT_RawBuffer, buffer );
+	set_tag( TT_BufferSize, PLAYBUFFERSIZE );
+	set_tag( TAG_DONE, 0 );
 
 	playing = RawPlaybackTagList( raw_playback_tags );
   
@@ -804,3 +857,32 @@ BOOL StartPlaying(struct AHIAudioCtrlDrv *AudioCtrl, struct Process *me)
 	return playing;
 }
 
+static BOOL CopyChannelToPlayback(struct UAEAudioChannel *chan, UBYTE *playBuf, ULONG bytesToCopy)
+{
+	if (!chan->active || chan->sound.address == NULL || chan->length == 0)
+		return FALSE;
+
+	if (chan -> reverse)
+	{
+		short *src, *dst, *dstEnd;
+
+		src = ((short *) chan -> sound.address) + (chan -> sound.length - chan -> offset) / sizeof(short); 
+
+		/* assume 16bit, make sure we don't swap the bytes */
+
+		if (dst<dstEnd)
+		{
+			*dst++ = *(--src);
+		}
+
+		chan -> offset += bytesToCopy;
+	}
+	else
+	{
+		const UBYTE *src = ((UBYTE *)chan->sound.address) + chan->offset;
+		CopyMemQuick( src, playBuf, bytesToCopy);
+		chan->offset += bytesToCopy;
+	}
+
+	return TRUE;
+}

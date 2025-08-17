@@ -7,13 +7,12 @@
 
 enum
 {
-	TT_ErrorTask = 1000,
-	TT_ErrorMask,
+	TT_PlayTask = 1000,
+	TT_PlaySignal,
 	TT_RawInt,
 	TT_Mode,
 	TT_Frequency,
-	TT_RawBuffer1,
-	TT_RawBuffer2,
+	TT_RawBuffer,
 	TT_BufferSize,
 	TT_RawIrqSize
 };

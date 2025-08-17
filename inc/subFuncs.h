@@ -42,7 +42,7 @@ ULONG uaeahi_SetSound(
 		REG(d0, UWORD Channel), 
 		REG(d1, UWORD Sound), 
 		REG(d2, UWORD Offset), 
-		REG(d3, UWORD Length), 
+		REG(d3, WORD Length), 
 		REG(a2, struct AHIAudioCtrlDrv * AudioCtrl), 
 		REG(d4, ULONG Flags));
 
